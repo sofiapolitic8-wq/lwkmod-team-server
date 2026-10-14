@@ -1,15 +1,23 @@
-/* LowKey team relay - no dependencies.   node server.js   (PORT env, default 8787)
+/* david.io team relay - no dependencies.   node server.js   (PORT env, default 8787)
    Speaks the same poll format the game already uses, so dots / chat / SOS / players list all just work.
-   POST /create  -> {tid, auth}          GET /poll?auth=..&tid=..&nick=..  -> JSON array of online teammates */
+   POST /create?name=..&group=..&max=..&fam=..  -> {tid, auth, name, group, max}   (fam = same value for all groups of one team)
+   POST /rename?tid=..&auth=..&name=..  -> {ok, name, groups}   renames the team in EVERY group (same fam)
+   GET  /groups?tid=..&auth=..  -> {name, groups:[{group,max,online}]}
+   GET  /info?tid=..&auth=..  -> {name, group, max, online}          GET /poll?auth=..&tid=..&nick=..  -> JSON array of online teammates */
 "use strict";
 const http = require("http"), fs = require("fs"), crypto = require("crypto"), path = require("path");
 const PORT = +process.env.PORT || 8787;
 const FILE = process.env.TEAMS_FILE || path.join(__dirname, "teams.json");
 const ALIVE_MS = 15000, MSG_MS = 9000, MAX_MEMBERS = 60, MAX_TEAMS = 5000;
+const clampMax = v => { v = parseInt(v, 10); return Number.isFinite(v) ? Math.max(2, Math.min(MAX_MEMBERS, v)) : 5; };
+const cleanName = v => String(v == null ? "" : v).replace(/[^\w .\-\u00C0-\u024F\u0900-\u097F]/g, "").trim().slice(0, 24);
+const cleanFam = v => String(v == null ? "" : v).replace(/[^A-Za-z0-9]/g, "").slice(0, 16);
+const cleanGroup = v => String(v == null ? "" : v).replace(/[^A-Za-z0-9]/g, "").toUpperCase().slice(0, 2);
 const INVALID = "bClBzw7tTJPV6GQ6gqmVsk5MR5oEclR3T1HcUDJR5FXisgl8L8IYXdTX01ZeF3k9Jor0UpxHavkxb73DEDM0SNRf23v0WHKtgJDHv40lWfhIxipG3LOIX0ZEUOtvVSeH";
 const ABC = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+const PFX = "DVD-";
 
-let teams = {};                       // tid -> {auth, created}
+let teams = {};                       // tid -> {auth, created, name, group, max, fam}
 try { teams = JSON.parse(fs.readFileSync(FILE, "utf8")); } catch (e) {}
 let dirty = false;
 setInterval(() => { if (dirty) { dirty = false; fs.writeFile(FILE, JSON.stringify(teams), () => {}); } }, 5000).unref();
@@ -25,7 +33,7 @@ const safeMsg = v => cut(v, 400).replace(/<br>/g, "\u0001").replace(/</g, "&lt;"
 const safeSrv = v => { v = cut(v, 80); return /^(_GAME_MENU_|[\w.:\-\[\]]*)$/.test(v) ? v : ""; };
 
 const hits = {};                      // tiny per-ip limiter for /create
-function limited(ip) { const t = Date.now(), h = (hits[ip] = (hits[ip] || []).filter(x => t - x < 60000)); if (h.length >= 10) return true; h.push(t); return false; }
+function limited(ip) { const t = Date.now(), h = (hits[ip] = (hits[ip] || []).filter(x => t - x < 60000)); if (h.length >= 40) return true; h.push(t); return false; }
 
 function send(res, code, body, type) {
   res.writeHead(code, { "Content-Type": type || "application/json", "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Private-Network": "true", "Cache-Control": "no-store" });
@@ -39,7 +47,7 @@ function poll(q, res) {
   const now = Date.now(), room = live[tid] || (live[tid] = new Map());
   for (const [k, m] of room) if (now - m.ts > ALIVE_MS) room.delete(k);
   let m = room.get(nick);
-  if (!m) { if (room.size >= MAX_MEMBERS) return send(res, 200, []); m = { msg: "", msgTs: 0 }; room.set(nick, m); }
+  if (!m) { if (room.size >= (t.max || MAX_MEMBERS)) return send(res, 200, []);   m = { msg: "", msgTs: 0 }; room.set(nick, m); }
   const msg = safeMsg(q.get("msg"));
   if (msg) { m.msg = msg; m.msgTs = now; }
   else if (now - m.msgTs > MSG_MS) m.msg = "";
@@ -69,11 +77,37 @@ http.createServer((req, res) => {
     const ip = req.headers["x-forwarded-for"] || req.socket.remoteAddress || "";
     if (limited(ip)) return send(res, 429, { error: "slow down" });
     if (Object.keys(teams).length >= MAX_TEAMS) return send(res, 507, { error: "full" });
-    let tid; do { tid = "LWK-" + rnd(16); } while (teams[tid]);
+    let tid; do { tid = PFX + rnd(16); } while (teams[tid]);
     const auth = rnd(20);
-    teams[tid] = { auth, created: Date.now() }; dirty = true;
-    return send(res, 200, { tid, auth });
+    const fam = cleanFam(u.searchParams.get("fam")), name = cleanName(u.searchParams.get("name")), group = cleanGroup(u.searchParams.get("group")), max = clampMax(u.searchParams.get("max"));
+    teams[tid] = { auth, created: Date.now(), name, group, max, fam }; dirty = true;
+    return send(res, 200, { tid, auth, name, group, max });
+  }
+  if (u.pathname === "/rename" && (req.method === "POST" || req.method === "GET")) {
+    const tid = cut(u.searchParams.get("tid"), 64), auth = cut(u.searchParams.get("auth"), 64), t = teams[tid];
+    if (!t || !eq(t.auth, auth)) return send(res, 404, { error: "invalid" });
+    const name = cleanName(u.searchParams.get("name")); if (!name) return send(res, 400, { error: "name" });
+    let n = 0; for (const k in teams) if (k === tid || (t.fam && teams[k].fam === t.fam)) { teams[k].name = name; n++; }
+    dirty = true; return send(res, 200, { ok: true, name, group: t.group || "", groups: n });
+  }
+  if (u.pathname === "/groups") {
+    const tid = cut(u.searchParams.get("tid"), 64), auth = cut(u.searchParams.get("auth"), 64), t = teams[tid];
+    if (!t || !eq(t.auth, auth)) return send(res, 404, { error: "invalid" });
+    const now = Date.now(), list = [];
+    for (const k in teams) if (k === tid || (t.fam && teams[k].fam === t.fam)) {
+      let online = 0; const room = live[k]; if (room) for (const m of room.values()) if (now - m.ts <= ALIVE_MS) online++;
+      list.push({ group: teams[k].group || "", max: teams[k].max || MAX_MEMBERS, online });
+    }
+    list.sort((a, b) => a.group < b.group ? -1 : a.group > b.group ? 1 : 0);
+    return send(res, 200, { name: t.name || "", groups: list });
+  }
+  if (u.pathname === "/info") {
+    const tid = cut(u.searchParams.get("tid"), 64), auth = cut(u.searchParams.get("auth"), 64), t = teams[tid];
+    if (!t || !eq(t.auth, auth)) return send(res, 404, { error: "invalid" });
+    const room = live[tid], now = Date.now(); let online = 0;
+    if (room) for (const m of room.values()) if (now - m.ts <= ALIVE_MS) online++;
+    return send(res, 200, { name: t.name || "", group: t.group || "", max: t.max || MAX_MEMBERS, online });
   }
   if (u.pathname === "/" || u.pathname === "/health") return send(res, 200, { ok: true, teams: Object.keys(teams).length });
   send(res, 404, { error: "not found" });
-}).listen(PORT, () => console.log("LowKey team server on :" + PORT));
+}).listen(PORT, () => console.log("david.io team server on :" + PORT));
